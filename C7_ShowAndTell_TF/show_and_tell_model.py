@@ -145,11 +145,12 @@ class ShowAndTellModel(object):
       input_seqs = tf.expand_dims(input_feed, 1)
 
       # No target sequences or input mask in inference mode.
+	  # 推断模式下，无target sequences、input mask
       target_seqs = None
       input_mask = None
     else:
       # Prefetch serialized SequenceExample protos.
-      # 获取
+      # 获取原始输入数据队列
       input_queue = input_ops.prefetch_input_data(
           self.reader,
           self.config.input_file_pattern,
@@ -161,18 +162,24 @@ class ShowAndTellModel(object):
 
       # Image processing and random distortion. Split across multiple threads
       # with each thread applying a slightly different distortion.
+      # 使用偶数个线程对图片进行
       assert self.config.num_preprocess_threads % 2 == 0
       images_and_captions = []
       for thread_id in range(self.config.num_preprocess_threads):
+        # 获取单个image-caption对的serialized_sequence_example数据
         serialized_sequence_example = input_queue.dequeue()
+        # 解析出原始图片数据和caption
         encoded_image, caption = input_ops.parse_sequence_example(
             serialized_sequence_example,
             image_feature=self.config.image_feature_name,
             caption_feature=self.config.caption_feature_name)
+        # 处于图片和随机颜色扭曲
         image = self.process_image(encoded_image, thread_id=thread_id)
+        # 添加到images_and_captions数组
         images_and_captions.append([image, caption])
 
       # Batch inputs.
+      # 把添加到images_and_captions数据转换为batch
       queue_capacity = (2 * self.config.num_preprocess_threads *
                         self.config.batch_size)
       images, input_seqs, target_seqs, input_mask = (
@@ -180,6 +187,7 @@ class ShowAndTellModel(object):
                                            batch_size=self.config.batch_size,
                                            queue_capacity=queue_capacity))
 
+    # 获取最终训练数据
     self.images = images
     self.input_seqs = input_seqs
     self.target_seqs = target_seqs
@@ -187,6 +195,7 @@ class ShowAndTellModel(object):
 
   def build_image_embeddings(self):
     """Builds the image model subgraph and generates image embeddings.
+    建立图片编码模型子网络InceptionV3，生成图片embedding特征
 
     Inputs:
       self.images
@@ -194,6 +203,7 @@ class ShowAndTellModel(object):
     Outputs:
       self.image_embeddings
     """
+    # 获取模型输出
     inception_output = image_embedding.inception_v3(
         self.images,
         trainable=self.train_inception,
@@ -202,6 +212,7 @@ class ShowAndTellModel(object):
         tf.GraphKeys.GLOBAL_VARIABLES, scope="InceptionV3")
 
     # Map inception output into embedding space.
+    # 把inception网络输出映射到embedding空间
     with tf.variable_scope("image_embedding") as scope:
       image_embeddings = tf.contrib.layers.fully_connected(
           inputs=inception_output,
@@ -218,6 +229,7 @@ class ShowAndTellModel(object):
 
   def build_seq_embeddings(self):
     """Builds the input sequence embeddings.
+    生caption中的word序列的embedding特征
 
     Inputs:
       self.input_seqs
@@ -225,6 +237,7 @@ class ShowAndTellModel(object):
     Outputs:
       self.seq_embeddings
     """
+    # cpu上执行word序列的embedding特征(矩阵查询方式)
     with tf.variable_scope("seq_embedding"), tf.device("/cpu:0"):
       embedding_map = tf.get_variable(
           name="map",
@@ -236,6 +249,7 @@ class ShowAndTellModel(object):
 
   def build_model(self):
     """Builds the model.
+    建立caption模型
 
     Inputs:
       self.image_embeddings
@@ -251,8 +265,10 @@ class ShowAndTellModel(object):
     # This LSTM cell has biases and outputs tanh(new_c) * sigmoid(o), but the
     # modified LSTM in the "Show and Tell" paper has no biases and outputs
     # new_c * sigmoid(o).
+    # 构建LSTM模型
     lstm_cell = tf.contrib.rnn.BasicLSTMCell(
         num_units=self.config.num_lstm_units, state_is_tuple=True)
+    # 训练阶段，添加dropout
     if self.mode == "train":
       lstm_cell = tf.contrib.rnn.DropoutWrapper(
           lstm_cell,
@@ -261,11 +277,14 @@ class ShowAndTellModel(object):
 
     with tf.variable_scope("lstm", initializer=self.initializer) as lstm_scope:
       # Feed the image embeddings to set the initial LSTM state.
+      # 获取LSTM的全零隐含状态
       zero_state = lstm_cell.zero_state(
           batch_size=self.image_embeddings.get_shape()[0], dtype=tf.float32)
+      # 把图片embedding特征作为LSTM的第一输入，获取初始隐含状态
       _, initial_state = lstm_cell(self.image_embeddings, zero_state)
 
       # Allow the LSTM variables to be reused.
+      # 运行LSTM权重参数重用
       lstm_scope.reuse_variables()
 
       if self.mode == "inference":
@@ -288,6 +307,7 @@ class ShowAndTellModel(object):
         tf.concat(axis=1, values=state_tuple, name="state")
       else:
         # Run the batch of sequence embeddings through the LSTM.
+        # 在batch数据上执行LSTM推断，获取输出
         sequence_length = tf.reduce_sum(self.input_mask, 1)
         lstm_outputs, _ = tf.nn.dynamic_rnn(cell=lstm_cell,
                                             inputs=self.seq_embeddings,
@@ -299,6 +319,7 @@ class ShowAndTellModel(object):
     # Stack batches vertically.
     lstm_outputs = tf.reshape(lstm_outputs, [-1, lstm_cell.output_size])
 
+    # 基于LSTM输出，进行全连接层推断
     with tf.variable_scope("logits") as logits_scope:
       logits = tf.contrib.layers.fully_connected(
           inputs=lstm_outputs,
@@ -310,10 +331,11 @@ class ShowAndTellModel(object):
     if self.mode == "inference":
       tf.nn.softmax(logits, name="softmax")
     else:
+      # 整理目标序列和真word序列的格式
       targets = tf.reshape(self.target_seqs, [-1])
       weights = tf.to_float(tf.reshape(self.input_mask, [-1]))
 
-      # Compute losses.
+      # 计算losses.
       losses = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=targets,
                                                               logits=logits)
       batch_loss = tf.div(tf.reduce_sum(tf.multiply(losses, weights)),
@@ -322,7 +344,7 @@ class ShowAndTellModel(object):
       tf.losses.add_loss(batch_loss)
       total_loss = tf.losses.get_total_loss()
 
-      # Add summaries.
+      # 添加总结
       tf.summary.scalar("losses/batch_loss", batch_loss)
       tf.summary.scalar("losses/total_loss", total_loss)
       for var in tf.trainable_variables():
@@ -333,7 +355,8 @@ class ShowAndTellModel(object):
       self.target_cross_entropy_loss_weights = weights  # Used in evaluation.
 
   def setup_inception_initializer(self):
-    """Sets up the function to restore inception variables from checkpoint."""
+    """Sets up the function to restore inception variables from checkpoint.
+    加载inception预训练模型参数"""
     if self.mode != "inference":
       # Restore inception variables only.
       saver = tf.train.Saver(self.inception_variables)
@@ -346,7 +369,8 @@ class ShowAndTellModel(object):
       self.init_fn = restore_fn
 
   def setup_global_step(self):
-    """Sets up the global step Tensor."""
+    """Sets up the global step Tensor.
+    建立Global step"""
     global_step = tf.Variable(
         initial_value=0,
         name="global_step",

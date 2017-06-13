@@ -76,7 +76,7 @@ def evaluate_model(sess, model, global_step, summary_writer, summary_op):
   start_time = time.time()
   sum_losses = 0.
   sum_weights = 0.
-  for i in xrange(num_eval_batches):
+  for i in range(num_eval_batches):
     cross_entropy_losses, weights = sess.run([
         model.target_cross_entropy_losses,
         model.target_cross_entropy_loss_weights
